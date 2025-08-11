@@ -5,6 +5,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
 
 // --- Constants ---
 #define WIFI_MANAGER_AP_NAME "SplitFlapClockSetup"
@@ -46,14 +48,25 @@
 #define CALIBRATION_MODE false
 
 // --- Global Variables for STEPS_PER_FLAP ---
-float g_minStepsPerFlap = 93.25f;
-float g_hrStepsPerFlap = 93.25f;
+float g_minStepsPerFlap = 93.0f;
+float g_hrStepsPerFlap = 93.0f;
 
 // --- Global Variables (will be loaded from Preferences) ---
 bool g_is24HourDisplay = false;
 long g_timezoneBaseOffset = -21600; // Default to Mountain Time (UTC-6)
 bool g_isDst = true; // Default to DST on
 long g_ntpOffsetSeconds = -21600; // Calculated from base + DST
+
+// --- NEW: Quiet Hours Settings ---
+bool g_quietHoursEnabled = false; // Off by default
+int g_quietHourStart = 22; // Default 10 PM
+int g_quietHourEnd = 7;    // Default 7 AM
+
+// --- NEW: Manual Time Settings ---
+bool g_isManualTimeMode = false;
+int g_manualHour = 10;
+int g_manualMinute = 10;
+unsigned long g_lastMinuteTick = 0;
 
 // --- Physical Clock Offset ---
 #define MINUTE_HOME_OFFSET 0
@@ -66,7 +79,116 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org");
 WebServer server(80);
 Preferences preferences;
 
-// --- HTML for Web Interface ---
+// --- Forward Declaration to fix compilation error ---
+String getFormattedTime();
+
+// --- NEW: Error Logger ---
+namespace Logger {
+    const int MAX_LOG_ENTRIES = 20;
+    const char* PREFS_NAMESPACE = "clock-logs";
+    
+    void add(String message) {
+        preferences.begin(PREFS_NAMESPACE, false);
+        int nextIndex = preferences.getInt("log_idx", 0);
+        int count = preferences.getInt("log_count", 0);
+
+        // Add timestamp to log message
+        String timestampedMessage = getFormattedTime() + " - " + message;
+
+        String key = "log_" + String(nextIndex);
+        preferences.putString(key.c_str(), timestampedMessage);
+        
+        nextIndex = (nextIndex + 1) % MAX_LOG_ENTRIES;
+        preferences.putInt("log_idx", nextIndex);
+        
+        if (count < MAX_LOG_ENTRIES) {
+            preferences.putInt("log_count", count + 1);
+        }
+
+        preferences.end();
+        Serial.println("LOG: " + timestampedMessage);
+    }
+
+    String getAll() {
+        preferences.begin(PREFS_NAMESPACE, true); // Read-only
+        String allLogs = "";
+        int logStart = preferences.getInt("log_idx", 0);
+        int count = preferences.getInt("log_count", 0);
+        
+        if (count == 0) {
+            preferences.end();
+            return "No log entries found.";
+        }
+        
+        // Read logs in chronological order
+        for (int i = 0; i < count; ++i) {
+            int entryIndex = (logStart + i) % MAX_LOG_ENTRIES;
+             if (count < MAX_LOG_ENTRIES) {
+                entryIndex = i;
+            } else {
+                entryIndex = (logStart + i) % MAX_LOG_ENTRIES;
+            }
+            String key = "log_" + String(entryIndex);
+            if (preferences.isKey(key.c_str())) {
+                allLogs += preferences.getString(key.c_str(), "") + "\n";
+            }
+        }
+        preferences.end();
+        return allLogs;
+    }
+
+    void clear() {
+        preferences.begin(PREFS_NAMESPACE, false);
+        preferences.clear();
+        preferences.putInt("log_count", 0); // Reset the count
+        preferences.putInt("log_idx", 0);
+        preferences.end();
+        Logger::add("Logs cleared.");
+    }
+}
+
+// --- NEW: Time Source Abstraction ---
+// This allows the clock to seamlessly switch between NTP and Manual time.
+int getCurrentHour() {
+    if (g_isManualTimeMode) {
+        return g_manualHour;
+    }
+    return timeClient.getHours();
+}
+
+int getCurrentMinute() {
+    if (g_isManualTimeMode) {
+        return g_manualMinute;
+    }
+    return timeClient.getMinutes();
+}
+
+String getFormattedTime() {
+    if (g_isManualTimeMode) {
+        char buf[9];
+        sprintf(buf, "%02d:%02d:--", g_manualHour, g_manualMinute);
+        return String(buf);
+    }
+    return timeClient.getFormattedTime();
+}
+
+// --- NEW: Quiet Hours Check ---
+bool isInQuietHours() {
+    if (!g_quietHoursEnabled) return false;
+    
+    int currentHour = getCurrentHour();
+    // Handle overnight period (e.g., 22:00 - 07:00)
+    if (g_quietHourStart > g_quietHourEnd) {
+        return (currentHour >= g_quietHourStart || currentHour < g_quietHourEnd);
+    }
+    // Handle same-day period (e.g., 09:00 - 17:00)
+    else {
+        return (currentHour >= g_quietHourStart && currentHour < g_quietHourEnd);
+    }
+}
+
+
+// --- HTML for Web Interface (Updated) ---
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head>
 <title>Split-Flap Clock Control</title>
@@ -76,15 +198,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
 .container { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
 h2, h3 { color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 10px; }
 .form-group { margin-bottom: 20px; }
+.form-group-inline { display: flex; align-items: center; gap: 10px; }
 label { display: block; margin-bottom: 5px; font-weight: bold; }
-select, .btn { padding: 12px; border-radius: 5px; border: 1px solid #ddd; width: 100%; box-sizing: border-box; font-size: 16px; }
+input[type=number], select, .btn { padding: 12px; border-radius: 5px; border: 1px solid #ddd; width: 100%; box-sizing: border-box; font-size: 16px; }
 .btn { border: none; cursor: pointer; margin-top: 10px; }
 .btn-primary { background-color: #007bff; color: white; }
+.btn-secondary { background-color: #6c757d; color: white; }
 .btn-danger { background-color: #dc3545; color: white; }
 #message { margin-top: 20px; padding: 10px; border-radius: 5px; display: none; text-align: center; }
 .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
 .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+.info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; padding: 10px; border-radius: 5px; margin-bottom: 15px; }
 #time-display { font-size: 1.5em; font-weight: bold; color: #333; text-align: center; background: #eee; padding: 15px; border-radius: 5px; }
+#log-viewer { display: none; margin-top: 15px; }
+#log-content { background: #222; color: #0f0; font-family: monospace; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }
 </style>
 </head><body>
 <div class="container">
@@ -92,112 +219,197 @@ select, .btn { padding: 12px; border-radius: 5px; border: 1px solid #ddd; width:
 <div id="time-display">--:--:--</div>
 <h2>Settings</h2>
 <form id="settingsForm">
+<h3>Time & Display</h3>
 <div class="form-group">
 <label for="timezone">Timezone (Standard Time)</label>
 <select id="timezone" name="timezone">
 <optgroup label="North America">
-<option value="-36000">Hawaii (UTC-10)</option>
-<option value="-32400">Alaska (UTC-9)</option>
-<option value="-28800">Pacific Time (UTC-8)</option>
-<option value="-25200">Mountain Time (UTC-7)</option>
-<option value="-21600">Central Time (UTC-6)</option>
-<option value="-18000">Eastern Time (UTC-5)</option>
-<option value="-14400">Atlantic Time (UTC-4)</option>
-<option value="-12600">Newfoundland (UTC-3:30)</option>
+<option value="-36000">Hawaii (UTC-10)</option><option value="-32400">Alaska (UTC-9)</option><option value="-28800">Pacific Time (UTC-8)</option><option value="-25200">Mountain Time (UTC-7)</option><option value="-21600">Central Time (UTC-6)</option><option value="-18000">Eastern Time (UTC-5)</option><option value="-14400">Atlantic Time (UTC-4)</option><option value="-12600">Newfoundland (UTC-3:30)</option>
 </optgroup>
 <optgroup label="Europe">
-<option value="0">Greenwich Mean Time (UTC+0)</option>
-<option value="3600">Central European Time (UTC+1)</option>
-<option value="7200">Eastern European Time (UTC+2)</option>
+<option value="0">Greenwich Mean Time (UTC+0)</option><option value="3600">Central European Time (UTC+1)</option><option value="7200">Eastern European Time (UTC+2)</option>
 </optgroup>
 <optgroup label="Asia & Oceania">
-<option value="19800">India (UTC+5:30)</option>
-<option value="20700">Nepal (UTC+5:45)</option>
-<option value="28800">Western Australia (UTC+8)</option>
-<option value="34200">Central Australia (UTC+9:30)</option>
-<option value="36000">Eastern Australia (UTC+10)</option>
-<option value="43200">New Zealand (UTC+12)</option>
+<option value="19800">India (UTC+5:30)</option><option value="20700">Nepal (UTC+5:45)</option><option value="28800">Western Australia (UTC+8)</option><option value="34200">Central Australia (UTC+9:30)</option><option value="36000">Eastern Australia (UTC+10)</option><option value="43200">New Zealand (UTC+12)</option>
 </optgroup>
 <optgroup label="Other">
-<option value="-10800">UTC-3</option><option value="-7200">UTC-2</option><option value="-3600">UTC-1</option>
-<option value="10800">UTC+3</option><option value="12600">Iran (UTC+3:30)</option>
-<option value="14400">UTC+4</option><option value="16200">Afghanistan (UTC+4:30)</option>
-<option value="18000">UTC+5</option><option value="21600">UTC+6</option><option value="25200">UTC+7</option>
-<option value="39600">UTC+11</option>
+<option value="-10800">UTC-3</option><option value="-7200">UTC-2</option><option value="-3600">UTC-1</option><option value="10800">UTC+3</option><option value="12600">Iran (UTC+3:30)</option><option value="14400">UTC+4</option><option value="16200">Afghanistan (UTC+4:30)</option><option value="18000">UTC+5</option><option value="21600">UTC+6</option><option value="25200">UTC+7</option><option value="39600">UTC+11</option>
 </optgroup>
 </select>
 </div>
 <div class="form-group">
-<label>Daylight Saving</label>
 <input type="checkbox" id="isDst" name="isDst" style="width:auto; vertical-align: middle;">
 <label for="isDst" style="display:inline; font-weight:normal;">Daylight Saving Time is active (+1 hour)</label>
 </div>
 <div class="form-group">
-<label>Display Format</label>
 <input type="checkbox" id="is24hour" name="is24hour" style="width:auto; vertical-align: middle;">
 <label for="is24hour" style="display:inline; font-weight:normal;">24-Hour Format</label>
 </div>
-<button type="submit" class="btn btn-primary">Save & Apply</button>
+<h3>Quiet Hours</h3>
+<div class="form-group">
+<input type="checkbox" id="quietEnabled" name="quietEnabled" style="width:auto; vertical-align: middle;">
+<label for="quietEnabled" style="display:inline; font-weight:normal;">Enable Quiet Hours (no flap movement)</label>
+</div>
+<div class="form-group-inline">
+<label for="quietStart" style="display:inline; font-weight:normal; margin-bottom:0;">Start:</label>
+<input type="number" id="quietStart" name="quietStart" min="0" max="23" style="width: 80px;">
+<label for="quietEnd" style="display:inline; font-weight:normal; margin-bottom:0;">End:</label>
+<input type="number" id="quietEnd" name="quietEnd" min="0" max="23" style="width: 80px;">
+</div>
+<button type="submit" class="btn btn-primary">Save All Settings & Use NTP</button>
 </form>
+
+<h3>Manual Time Set</h3>
+<form id="manualTimeForm">
+<div class="form-group-inline">
+<label for="manualHour" style="display:inline; font-weight:normal; margin-bottom:0;">Hour (0-23):</label>
+<input type="number" id="manualHour" name="manualHour" min="0" max="23" style="width: 80px;">
+<label for="manualMinute" style="display:inline; font-weight:normal; margin-bottom:0;">Minute (0-59):</label>
+<input type="number" id="manualMinute" name="manualMinute" min="0" max="59" style="width: 80px;">
+</div>
+<button type="submit" class="btn btn-secondary">Set Time Manually & Use It</button>
+</form>
+
 <h3>System</h3>
+<div class="info">OTA Updates are enabled. Upload new firmware from the Arduino IDE via the network port (splitflapclock.local).</div>
+<button onclick="toggleLogViewer()" class="btn btn-secondary">View Error Log</button>
+<button onclick="clearLogs()" class="btn btn-danger">Clear Error Log</button>
 <button onclick="restartClock()" class="btn btn-danger">Restart Clock</button>
+<div id="log-viewer"><pre id="log-content">Loading logs...</pre></div>
 <div id="message"></div>
 </div>
 <script>
 function updateTime() {
-fetch('/getTime')
-.then(response => response.text())
-.then(data => {
-document.getElementById('time-display').textContent = data;
-});
+    fetch('/getTime')
+    .then(response => response.text())
+    .then(data => {
+        document.getElementById('time-display').textContent = data;
+    });
 }
-document.addEventListener('DOMContentLoaded', function() {
-fetch('/getSettings')
-.then(response => response.json())
-.then(data => {
-document.getElementById('timezone').value = data.timezone;
-document.getElementById('is24hour').checked = data.is24hour;
-document.getElementById('isDst').checked = data.isDst;
-});
-updateTime();
-setInterval(updateTime, 5000);
-});
-document.getElementById('settingsForm').addEventListener('submit', function(event) {
-event.preventDefault();
-const timezone = document.getElementById('timezone').value;
-const is24hour = document.getElementById('is24hour').checked;
-const isDst = document.getElementById('isDst').checked;
-const messageDiv = document.getElementById('message');
-fetch(`/save?timezone=${timezone}&is24hour=${is24hour}&isDst=${isDst}`)
-.then(response => {
-if(response.ok) {
-messageDiv.textContent = 'Settings saved! Clock is re-homing...';
-messageDiv.className = 'success';
-} else {
-response.text().then(text => {
-    messageDiv.textContent = 'Failed to save settings: ' + text;
-    messageDiv.className = 'error';
-});
+
+function loadSettings() {
+    fetch('/getSettings')
+    .then(response => response.json())
+    .then(data => {
+        document.getElementById('timezone').value = data.timezone;
+        document.getElementById('is24hour').checked = data.is24hour;
+        document.getElementById('isDst').checked = data.isDst;
+        document.getElementById('quietEnabled').checked = data.quietEnabled;
+        document.getElementById('quietStart').value = data.quietStart;
+        document.getElementById('quietEnd').value = data.quietEnd;
+        
+        const now = new Date();
+        document.getElementById('manualHour').value = data.manualHour || now.getHours();
+        document.getElementById('manualMinute').value = data.manualMinute || now.getMinutes();
+    });
 }
-messageDiv.style.display = 'block';
-});
-});
+
+function toggleLogViewer() {
+    const viewer = document.getElementById('log-viewer');
+    const content = document.getElementById('log-content');
+    if (viewer.style.display === 'block') {
+        viewer.style.display = 'none';
+    } else {
+        viewer.style.display = 'block';
+        content.textContent = 'Loading logs...';
+        fetch('/getLogs')
+        .then(response => response.text())
+        .then(data => {
+            content.textContent = data;
+        });
+    }
+}
+
+function clearLogs() {
+    const messageDiv = document.getElementById('message');
+    if (confirm('Are you sure you want to clear all log entries? This cannot be undone.')) {
+        fetch('/clearLogs')
+        .then(response => {
+            if (response.ok) {
+                messageDiv.textContent = 'Logs cleared successfully.';
+                messageDiv.className = 'success';
+                if (document.getElementById('log-viewer').style.display === 'block') {
+                    document.getElementById('log-content').textContent = 'Logs have been cleared.';
+                }
+            } else {
+                messageDiv.textContent = 'Failed to clear logs.';
+                messageDiv.className = 'error';
+            }
+            messageDiv.style.display = 'block';
+        });
+    }
+}
+
 function restartClock() {
-const messageDiv = document.getElementById('message');
-if(confirm('Are you sure you want to restart the clock?')) {
-fetch('/restart')
-.then(() => {
-messageDiv.textContent = 'Clock is restarting...';
-messageDiv.className = 'success';
-messageDiv.style.display = 'block';
+    const messageDiv = document.getElementById('message');
+    if (confirm('Are you sure you want to restart the clock?')) {
+        fetch('/restart')
+        .then(() => {
+            messageDiv.textContent = 'Clock is restarting...';
+            messageDiv.className = 'success';
+            messageDiv.style.display = 'block';
+        });
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadSettings();
+    updateTime();
+    setInterval(updateTime, 5000);
 });
-}
-}
+
+document.getElementById('settingsForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    const timezone = document.getElementById('timezone').value;
+    const is24hour = document.getElementById('is24hour').checked;
+    const isDst = document.getElementById('isDst').checked;
+    const quietEnabled = document.getElementById('quietEnabled').checked;
+    const quietStart = document.getElementById('quietStart').value;
+    const quietEnd = document.getElementById('quietEnd').value;
+    const messageDiv = document.getElementById('message');
+
+    const url = `/save?timezone=${timezone}&is24hour=${is24hour}&isDst=${isDst}&quietEnabled=${quietEnabled}&quietStart=${quietStart}&quietEnd=${quietEnd}`;
+
+    fetch(url)
+    .then(response => {
+        if(response.ok) {
+            messageDiv.textContent = 'Settings saved! Clock is re-homing and switching to NTP time...';
+            messageDiv.className = 'success';
+        } else {
+            response.text().then(text => {
+                messageDiv.textContent = 'Failed to save settings: ' + text;
+                messageDiv.className = 'error';
+            });
+        }
+        messageDiv.style.display = 'block';
+    });
+});
+
+document.getElementById('manualTimeForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    const hour = document.getElementById('manualHour').value;
+    const minute = document.getElementById('manualMinute').value;
+    const messageDiv = document.getElementById('message');
+    
+    fetch(`/setManualTime?hour=${hour}&minute=${minute}`)
+    .then(response => {
+        if(response.ok) {
+            messageDiv.textContent = 'Manual time set! Clock is re-homing...';
+            messageDiv.className = 'success';
+        } else {
+            response.text().then(text => {
+                messageDiv.textContent = 'Failed to set time: ' + text;
+                messageDiv.className = 'error';
+            });
+        }
+        messageDiv.style.display = 'block';
+    });
+});
 </script>
 </body></html>
 )rawliteral";
 
-// --- Stepper Motor Class ---
+// --- Stepper Motor Class (Unchanged) ---
 class StepperMotor {
 public:
     StepperMotor(int in1, int in2, int in3, int in4, int stepsPerRev, bool reverseDirection = false) {
@@ -271,10 +483,11 @@ private:
     }
 };
 
-// --- Split-Flap Clock Class ---
+// --- Split-Flap Clock Class (Updated) ---
 class SplitFlapClock {
 public:
-    enum ClockState { IDLE, RUNNING, CALIBRATION, MINUTE_ALIGN, ERROR_STATE };
+    // NEW: Added QUIET_MODE state
+    enum ClockState { IDLE, RUNNING, CALIBRATION, MINUTE_ALIGN, QUIET_MODE, ERROR_STATE };
 
     SplitFlapClock(StepperMotor& minMotor, StepperMotor& hrMotor, int minEndstop, int hrEndstop)
     : _minutesMotor(minMotor), _hoursMotor(hrMotor) {
@@ -290,10 +503,26 @@ public:
             _hoursMotor.update();
         }
         
+        // State machine logic
         if (_state == RUNNING) {
+            if (isInQuietHours()) {
+                Serial.println("Entering Quiet Hours.");
+                Logger::add("Entering Quiet Hours.");
+                _state = QUIET_MODE;
+                return;
+            }
             handleRunning();
         } else if (_state == MINUTE_ALIGN) {
             handleMinuteAlign();
+        } else if (_state == QUIET_MODE) {
+            if (!isInQuietHours()) {
+                Serial.println("Exiting Quiet Hours. Catching up...");
+                Logger::add("Exiting Quiet Hours. Catching up.");
+                _state = IDLE; // Prevent running state logic while moving
+                moveToCurrentTime();
+                _state = RUNNING;
+                Serial.println("Catch up complete. Resuming normal operation.");
+            }
         }
     }
 
@@ -315,7 +544,9 @@ public:
 
         if (!minHomed) {
             _state = ERROR_STATE;
-            Serial.println("!!! FATAL: Minute homing failed. Displaying error code.");
+            String errorMsg = "FATAL: Minute homing failed.";
+            Serial.println("!!! " + errorMsg + " Displaying error code.");
+            Logger::add(errorMsg);
             if (hrHomed) {
                 moveToAbsoluteFlap(_hoursMotor, _currentHourFlap, _hourStepError, g_hrStepsPerFlap, ERROR_CODE_MIN_HOME_FAIL_HR, 24);
                 moveToAbsoluteFlap(_minutesMotor, _currentMinuteFlap, _minuteStepError, g_minStepsPerFlap, ERROR_CODE_MIN_HOME_FAIL_MIN, 60);
@@ -324,7 +555,9 @@ public:
         }
         if (!hrHomed) {
             _state = ERROR_STATE;
-            Serial.println("!!! FATAL: Hour homing failed. Displaying error code.");
+            String errorMsg = "FATAL: Hour homing failed.";
+            Serial.println("!!! " + errorMsg + " Displaying error code.");
+            Logger::add(errorMsg);
             moveToAbsoluteFlap(_minutesMotor, _currentMinuteFlap, _minuteStepError, g_minStepsPerFlap, ERROR_CODE_HR_HOME_FAIL_MIN, 60);
             moveToAbsoluteFlap(_hoursMotor, _currentHourFlap, _hourStepError, g_hrStepsPerFlap, ERROR_CODE_HR_HOME_FAIL_HR, 24);
             return false;
@@ -333,15 +566,23 @@ public:
         #if CALIBRATION_MODE
             enterCalibrationMode();
         #else
-            moveToCurrentTime();
-            _state = RUNNING;
-            Serial.println("--- Initialization Complete. Clock is now running. ---");
+            if (isInQuietHours()) {
+                Serial.println("Initializing into Quiet Hours. Flaps will not move until quiet hours end.");
+                Logger::add("Initialized into Quiet Hours.");
+                _state = QUIET_MODE;
+            } else {
+                moveToCurrentTime();
+                _state = RUNNING;
+                Serial.println("--- Initialization Complete. Clock is now running. ---");
+            }
         #endif
         return true;
     }
     
     void displaySystemError(int hourFlapCode, int minuteFlapCode) {
-        Serial.printf("!!! SYSTEM ERROR: Displaying H:%d M:%d\n", hourFlapCode, minuteFlapCode);
+        String errorMsg = "SYSTEM ERROR: Displaying H:" + String(hourFlapCode) + " M:" + String(minuteFlapCode);
+        Serial.println("!!! " + errorMsg);
+        Logger::add(errorMsg);
         _state = IDLE;
         
         bool minHomed = homeMotor(_minutesMotor, _minEndstopPin, "Minutes (Error recovery)");
@@ -357,7 +598,9 @@ public:
             moveToAbsoluteFlap(_hoursMotor, _currentHourFlap, _hourStepError, g_hrStepsPerFlap, hourFlapCode, 24);
             moveToAbsoluteFlap(_minutesMotor, _currentMinuteFlap, _minuteStepError, g_minStepsPerFlap, minuteFlapCode, 60);
         } else {
-            Serial.println("!!! Catastrophic failure: Could not home motors to display error code.");
+            String fatalMsg = "Catastrophic failure: Could not home motors to display error code.";
+            Serial.println("!!! " + fatalMsg);
+            Logger::add(fatalMsg);
         }
     }
 
@@ -368,7 +611,6 @@ public:
         Serial.println("Current STEPS_PER_FLAP (Hours): " + String(g_hrStepsPerFlap, 3));
         Serial.println("Commands (e.g., 'sm93.5'):");
         Serial.println(" 'm'/'h': Move 1 flap | 'M'/'H': Move 10 flaps");
-        Serial.println(" 'sm<value>', 'sh<value>' : Set steps per flap.");
         Serial.println(" 'se' : Show Endstop states.");
         _minutesMotor.stop();
         _hoursMotor.stop();
@@ -397,6 +639,7 @@ private:
         motor.setSpeed(HOMING_SPEED_STEPS_PER_SEC);
         motor.moveSteps(MOTOR_STEPS_PER_REVOLUTION * 3);
 
+        unsigned long startTime = millis();
         while (motor.isMoving()) {
             motor.update();
             if (digitalRead(endstopPin) == LOW) {
@@ -404,9 +647,18 @@ private:
                 Serial.printf("%s endstop triggered. Motor homed successfully.\n", name);
                 return true;
             }
+            if (millis() - startTime > 15000) { // 15 second timeout
+                motor.stop();
+                String errorMsg = "HOMING FAILED: " + String(name) + " endstop not found within timeout.";
+                Serial.println("!!! " + errorMsg + " !!!");
+                Logger::add(errorMsg);
+                return false;
+            }
         }
         
-        Serial.printf("!!! HOMING FAILED: %s endstop not found. !!!\n", name);
+        String errorMsg = "HOMING FAILED: " + String(name) + " endstop not found.";
+        Serial.println("!!! " + errorMsg + " !!!");
+        Logger::add(errorMsg);
         return false;
     }
 
@@ -422,7 +674,8 @@ private:
 
             while(motor.isMoving()) {
                 motor.update();
-                yield(); // Feeds the watchdog timer to prevent resets on long moves
+                ArduinoOTA.handle(); // Keep OTA responsive during long moves
+                yield(); // Feeds the watchdog timer
             }
         }
     }
@@ -440,16 +693,18 @@ private:
         if (g_is24HourDisplay) {
             return hour24;
         } else {
-            if (hour24 == 0) return 12;
+            if (hour24 == 0 || hour24 == 12) return 12; // Midnight and Noon are 12
             if (hour24 > 12) return hour24 - 12;
             return hour24;
         }
     }
 
     void moveToCurrentTime() {
-        timeClient.update();
-        int currentMinute = timeClient.getMinutes();
-        int currentHour = timeClient.getHours();
+        if (!g_isManualTimeMode) {
+            timeClient.update();
+        }
+        int currentMinute = getCurrentMinute();
+        int currentHour = getCurrentHour();
 
         int targetHourFlap = getTargetHourFlap(currentHour);
         int targetMinuteFlap = currentMinute;
@@ -466,12 +721,16 @@ private:
     bool checkForDrift() {
         if (_minutesMotor.isMoving() || _hoursMotor.isMoving()) return false;
         if (digitalRead(_minEndstopPin) == LOW && _currentMinuteFlap != MINUTE_HOME_OFFSET) {
-            Serial.printf("!!! DRIFT DETECTED on minutes. Expected %d but found home. Re-homing... !!!\n", _currentMinuteFlap);
+            String errorMsg = "DRIFT DETECTED on minutes. Expected " + String(_currentMinuteFlap) + " but found home. Re-homing...";
+            Serial.println("!!! " + errorMsg + " !!!");
+            Logger::add(errorMsg);
             initialize();
             return true;
         }
         if (digitalRead(_hrEndstopPin) == LOW && _currentHourFlap != HOUR_HOME_POSITION) {
-            Serial.printf("!!! DRIFT DETECTED on hours. Expected flap %d but found home (flap %d). Re-homing... !!!\n", _currentHourFlap, HOUR_HOME_POSITION);
+            String errorMsg = "DRIFT DETECTED on hours. Expected flap " + String(_currentHourFlap) + " but found home. Re-homing...";
+            Serial.println("!!! " + errorMsg + " !!!");
+            Logger::add(errorMsg);
             initialize();
             return true;
         }
@@ -492,7 +751,7 @@ private:
     }
 
     void handleHourChange() {
-        int currentHour = timeClient.getHours();
+        int currentHour = getCurrentHour();
         int targetHourFlap = getTargetHourFlap(currentHour);
 
         if (targetHourFlap != _currentHourFlap) {
@@ -508,22 +767,26 @@ private:
     void handleRunning() {
         if (checkForDrift()) return;
 
-        timeClient.update();
-        int currentMinute = timeClient.getMinutes();
+        if (!g_isManualTimeMode) {
+            timeClient.update();
+        }
+        int currentMinute = getCurrentMinute();
 
         if (currentMinute == _currentMinuteFlap) return;
 
+        // --- Re-homing Logic ---
         if (currentMinute == 0 && _currentMinuteFlap == 59) {
-            int currentHour = timeClient.getHours();
+            int currentHour = getCurrentHour();
             bool needsFullRehome = false;
-            if (g_is24HourDisplay && currentHour == 0) {
-                needsFullRehome = true;
-            } else if (!g_is24HourDisplay && (currentHour == 1 || currentHour == 13)) {
-                needsFullRehome = true;
+            // Re-home at 3 AM daily to ensure long-term accuracy
+            if (currentHour == 3) {
+                 needsFullRehome = true;
             }
 
             if (needsFullRehome) {
-                Serial.printf("Scheduled re-homing at %02d:00. Re-initializing clock...\n", currentHour);
+                String msg = "Scheduled re-homing at " + String(currentHour) + ":00. Re-initializing clock...";
+                Serial.println(msg);
+                Logger::add(msg);
                 initialize();
                 return;
             }
@@ -551,19 +814,26 @@ void setupWebServer() {
     });
 
     server.on("/getTime", HTTP_GET, [](){
-        server.send(200, "text/plain", timeClient.getFormattedTime());
+        server.send(200, "text/plain", getFormattedTime());
     });
 
     server.on("/getSettings", HTTP_GET, [](){
         String json = "{";
         json += "\"timezone\":" + String(g_timezoneBaseOffset) + ",";
         json += "\"is24hour\":" + String(g_is24HourDisplay ? "true" : "false") + ",";
-        json += "\"isDst\":" + String(g_isDst ? "true" : "false");
+        json += "\"isDst\":" + String(g_isDst ? "true" : "false") + ",";
+        json += "\"quietEnabled\":" + String(g_quietHoursEnabled ? "true" : "false") + ",";
+        json += "\"quietStart\":" + String(g_quietHourStart) + ",";
+        json += "\"quietEnd\":" + String(g_quietHourEnd) + ",";
+        json += "\"manualHour\":" + String(g_manualHour) + ",";
+        json += "\"manualMinute\":" + String(g_manualMinute);
         json += "}";
         server.send(200, "application/json", json);
     });
 
     server.on("/save", HTTP_GET, [](){
+        g_isManualTimeMode = false; // Saving settings implies switching back to NTP
+        
         if(server.hasArg("timezone")) {
             g_timezoneBaseOffset = server.arg("timezone").toInt();
             preferences.putLong("timezone", g_timezoneBaseOffset);
@@ -576,6 +846,18 @@ void setupWebServer() {
             g_isDst = server.arg("isDst") == "true";
             preferences.putBool("isDst", g_isDst);
         }
+        if(server.hasArg("quietEnabled")) {
+            g_quietHoursEnabled = server.arg("quietEnabled") == "true";
+            preferences.putBool("quietEn", g_quietHoursEnabled);
+        }
+        if(server.hasArg("quietStart")) {
+            g_quietHourStart = server.arg("quietStart").toInt();
+            preferences.putInt("quietSt", g_quietHourStart);
+        }
+        if(server.hasArg("quietEnd")) {
+            g_quietHourEnd = server.arg("quietEnd").toInt();
+            preferences.putInt("quietEn", g_quietHourEnd);
+        }
 
         g_ntpOffsetSeconds = g_timezoneBaseOffset + (g_isDst ? 3600 : 0);
         timeClient.setTimeOffset(g_ntpOffsetSeconds);
@@ -585,6 +867,34 @@ void setupWebServer() {
         } else {
             server.send(500, "text/plain", "Homing failed after save. Check clock mechanism.");
         }
+    });
+
+    server.on("/setManualTime", HTTP_GET, [](){
+        g_isManualTimeMode = true;
+        if(server.hasArg("hour")) {
+            g_manualHour = server.arg("hour").toInt();
+        }
+        if(server.hasArg("minute")) {
+            g_manualMinute = server.arg("minute").toInt();
+        }
+        g_lastMinuteTick = millis(); // Reset manual time ticker
+
+        Logger::add("Switched to Manual Time: " + String(g_manualHour) + ":" + String(g_manualMinute));
+
+        if (splitFlapClock.initialize()) {
+            server.send(200, "text/plain", "OK");
+        } else {
+            server.send(500, "text/plain", "Homing failed after setting manual time.");
+        }
+    });
+
+    server.on("/getLogs", HTTP_GET, [](){
+        server.send(200, "text/plain", Logger::getAll());
+    });
+
+    server.on("/clearLogs", HTTP_GET, [](){
+        Logger::clear();
+        server.send(200, "text/plain", "Logs cleared.");
     });
 
     server.on("/restart", HTTP_GET, [](){
@@ -597,30 +907,66 @@ void setupWebServer() {
     Serial.println("Web server started.");
 }
 
+void setupOTA() {
+    ArduinoOTA.setHostname("splitflapclock");
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+            type = "sketch";
+        } else { // U_SPIFFS
+            type = "filesystem";
+        }
+        Serial.println("Start updating " + type);
+        Logger::add("OTA Update Started...");
+    }).onEnd([]() {
+        Serial.println("\nEnd");
+        Logger::add("OTA Update Finished.");
+    }).onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    }).onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR) Serial.println("End Failed");
+        Logger::add("OTA Error: " + String(error));
+    });
+    ArduinoOTA.begin();
+    Serial.println("OTA Ready.");
+}
+
 void loadSettings() {
     preferences.begin("clock-settings", false);
     g_timezoneBaseOffset = preferences.getLong("timezone", -21600); // Default Mountain
     g_is24HourDisplay = preferences.getBool("is24hour", false);
-    g_isDst = preferences.getBool("isDst", true); // Default DST on for summer
+    g_isDst = preferences.getBool("isDst", true);
+    g_quietHoursEnabled = preferences.getBool("quietEn", false);
+    g_quietHourStart = preferences.getInt("quietSt", 22);
+    g_quietHourEnd = preferences.getInt("quietEn", 7);
 
     g_ntpOffsetSeconds = g_timezoneBaseOffset + (g_isDst ? 3600 : 0);
 
     Serial.printf("Loaded settings: TZ Base=%ld, DST=%s -> Final Offset=%ld, 24-Hour=%s\n",
         g_timezoneBaseOffset, g_isDst ? "Yes" : "No", g_ntpOffsetSeconds, g_is24HourDisplay ? "Yes" : "No");
+    Serial.printf("Quiet Hours: Enabled=%s, Start=%d, End=%d\n",
+        g_quietHoursEnabled ? "Yes" : "No", g_quietHourStart, g_quietHourEnd);
 }
 
 // --- Setup Function ---
 void setup() {
     Serial.begin(115200);
-    Serial.println("\nStarting Split-Flap Clock...");
+    Serial.println("\nStarting Split-Flap Clock v2...");
 
+    preferences.begin("clock-settings", false);
     loadSettings();
 
     wifiManager.setAPCallback([](WiFiManager* wm) { Serial.println("Entered WiFiManager AP mode."); });
     if (!wifiManager.autoConnect(WIFI_MANAGER_AP_NAME)) {
         Serial.println("Failed to connect to WiFi. Halting with error code.");
+        Logger::add("FATAL: WiFi connection failed.");
         splitFlapClock.displaySystemError(ERROR_CODE_NO_WIFI_HR, ERROR_CODE_NO_WIFI_MIN);
-        while(1) { yield(); } // Halt execution but don't trigger watchdog
+        while(1) { yield(); } // Halt execution
     }
     Serial.println("WiFi Connected!");
     Serial.print("IP Address: ");
@@ -630,6 +976,7 @@ void setup() {
         Serial.println("mDNS responder started. Access at http://splitflapclock.local");
     } else {
         Serial.println("Error setting up MDNS responder! Halting with error code.");
+        Logger::add("FATAL: mDNS setup failed.");
         splitFlapClock.displaySystemError(ERROR_CODE_WEB_FAIL_HR, ERROR_CODE_WEB_FAIL_MIN);
         while(1) { yield(); } // Halt execution
     }
@@ -645,19 +992,37 @@ void setup() {
     }
     Serial.print("\nNTP Time Synced: ");
     Serial.println(timeClient.getFormattedTime());
+    Logger::add("System Started. NTP time synced.");
 
     setupWebServer();
+    setupOTA();
 
     if (!splitFlapClock.initialize()) {
         Serial.println("Clock initialization failed. Check serial monitor for details. Halting.");
-        while(1) { yield(); } // Halt execution
+        while(1) { ArduinoOTA.handle(); yield(); } // Halt execution but keep OTA alive
     }
 }
 
 // --- Loop Function ---
 void loop() {
+    ArduinoOTA.handle();
     server.handleClient();
     splitFlapClock.update();
+
+    // Handle manual time progression
+    if (g_isManualTimeMode) {
+        if (millis() - g_lastMinuteTick >= 60000) {
+            g_lastMinuteTick += 60000;
+            g_manualMinute++;
+            if (g_manualMinute >= 60) {
+                g_manualMinute = 0;
+                g_manualHour++;
+                if (g_manualHour >= 24) {
+                    g_manualHour = 0;
+                }
+            }
+        }
+    }
 
     #if CALIBRATION_MODE
     if (Serial.available()) {
