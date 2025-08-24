@@ -38,8 +38,8 @@
 #define MOTOR_STEPS_PER_REVOLUTION 4096
 
 // Speeds (steps per second)
-#define HOMING_SPEED_STEPS_PER_SEC 420
-#define NORMAL_SPEED_STEPS_PER_SEC 420
+#define HOMING_SPEED_STEPS_PER_SEC 650
+#define NORMAL_SPEED_STEPS_PER_SEC 650
 
 // Time constants
 #define NTP_UPDATE_INTERVAL_MS 30000
@@ -57,12 +57,20 @@ long g_timezoneBaseOffset = -21600; // Default to Mountain Time (UTC-6)
 bool g_isDst = true; // Default to DST on
 long g_ntpOffsetSeconds = -21600; // Calculated from base + DST
 
-// --- NEW: Quiet Hours Settings ---
-bool g_quietHoursEnabled = false; // Off by default
-int g_quietHourStart = 22; // Default 10 PM
-int g_quietHourEnd = 7;    // Default 7 AM
+// --- Quiet Hours Settings (Revised for multiple schedules) ---
+bool g_quietHoursEnabled = false; // Master enable switch
 
-// --- NEW: Manual Time Settings ---
+// Schedule A (e.g., Weekdays)
+int g_quietStartA = 21; // Default 9 PM
+int g_quietEndA = 7;    // Default 7 AM
+uint8_t g_quietDaysA = 0b00011110; // Default Mon, Tue, Wed, Thu (Bit order: SMTWTFS)
+
+// Schedule B (e.g., Weekends)
+int g_quietStartB = 23; // Default 11 PM
+int g_quietEndB = 10;   // Default 10 AM
+uint8_t g_quietDaysB = 0b01100001; // Default Fri, Sat, Sun
+
+// --- Manual Time Settings ---
 bool g_isManualTimeMode = false;
 int g_manualHour = 10;
 int g_manualMinute = 10;
@@ -82,7 +90,7 @@ Preferences preferences;
 // --- Forward Declaration to fix compilation error ---
 String getFormattedTime();
 
-// --- NEW: Error Logger ---
+// --- Error Logger ---
 namespace Logger {
     const int MAX_LOG_ENTRIES = 20;
     const char* PREFS_NAMESPACE = "clock-logs";
@@ -124,9 +132,9 @@ namespace Logger {
         for (int i = 0; i < count; ++i) {
             int entryIndex;
              if (count < MAX_LOG_ENTRIES) {
-                entryIndex = i;
+                 entryIndex = i;
             } else {
-                entryIndex = (logStart + i) % MAX_LOG_ENTRIES;
+                 entryIndex = (logStart + i) % MAX_LOG_ENTRIES;
             }
             String key = "log_" + String(entryIndex);
             if (preferences.isKey(key.c_str())) {
@@ -147,7 +155,7 @@ namespace Logger {
     }
 }
 
-// --- NEW: Time Source Abstraction ---
+// --- Time Source Abstraction ---
 // This allows the clock to seamlessly switch between NTP and Manual time.
 int getCurrentHour() {
     if (g_isManualTimeMode) {
@@ -172,23 +180,43 @@ String getFormattedTime() {
     return timeClient.getFormattedTime();
 }
 
-// --- NEW: Quiet Hours Check ---
+// --- Helper to check if NTP is running ---
+// The day-specific Quiet Hours function relies on the day of the week, which is only available from NTP.
+bool isNtpActive() {
+    return !g_isManualTimeMode && WiFi.status() == WL_CONNECTED;
+}
+
+// --- Quiet Hours Check (Revised for day-specific schedules) ---
 bool isInQuietHours() {
-    if (!g_quietHoursEnabled) return false;
+    // Quiet hours are disabled if the master switch is off OR if we are in manual mode (since we don't know the day of the week).
+    if (!g_quietHoursEnabled || !isNtpActive()) return false;
     
     int currentHour = getCurrentHour();
-    // Handle overnight period (e.g., 22:00 - 07:00)
-    if (g_quietHourStart > g_quietHourEnd) {
-        return (currentHour >= g_quietHourStart || currentHour < g_quietHourEnd);
+    int dayOfWeek = timeClient.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+
+    // Check Schedule A: Is today's bit set in the bitmask for Schedule A?
+    if ((g_quietDaysA >> dayOfWeek) & 1) { 
+        if (g_quietStartA > g_quietEndA) { // Overnight schedule (e.g., 22:00 - 07:00)
+            if (currentHour >= g_quietStartA || currentHour < g_quietEndA) return true;
+        } else { // Same-day schedule (e.g., 09:00 - 17:00)
+            if (currentHour >= g_quietStartA && currentHour < g_quietEndA) return true;
+        }
     }
-    // Handle same-day period (e.g., 09:00 - 17:00)
-    else {
-        return (currentHour >= g_quietHourStart && currentHour < g_quietHourEnd);
+    
+    // Check Schedule B: Is today's bit set in the bitmask for Schedule B?
+    if ((g_quietDaysB >> dayOfWeek) & 1) { 
+        if (g_quietStartB > g_quietEndB) { // Overnight schedule
+            if (currentHour >= g_quietStartB || currentHour < g_quietEndB) return true;
+        } else { // Same-day schedule
+            if (currentHour >= g_quietStartB && currentHour < g_quietEndB) return true;
+        }
     }
+    
+    return false; // Not in quiet hours for any active schedule today
 }
 
 
-// --- HTML for Web Interface (Updated for AM/PM UX) ---
+// --- HTML for Web Interface (Updated for day-specific Quiet Hours) ---
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head>
 <title>Split-Flap Clock Control</title>
@@ -214,6 +242,11 @@ input[type=number], select, .btn { padding: 12px; border-radius: 5px; border: 1p
 #time-display { font-size: 1.5em; font-weight: bold; color: #333; text-align: center; background: #eee; padding: 15px; border-radius: 5px; }
 #log-viewer { display: none; margin-top: 15px; }
 #log-content { background: #222; color: #0f0; font-family: monospace; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }
+.schedule-box { border: 1px solid #eee; padding: 15px; border-radius: 5px; margin-top: 10px; }
+.schedule-title { font-weight: bold; color: #555; margin-bottom: 10px; }
+.day-selector { display: flex; justify-content: space-between; margin-top: 10px; }
+.day-button { padding: 8px 12px; border: 1px solid #ddd; border-radius: 20px; cursor: pointer; user-select: none; transition: background-color 0.2s, color 0.2s; }
+.day-button.active { background-color: #007bff; color: white; border-color: #007bff; }
 </style>
 </head><body>
 <div class="container">
@@ -244,27 +277,69 @@ input[type=number], select, .btn { padding: 12px; border-radius: 5px; border: 1p
 <input type="checkbox" id="is24hour" name="is24hour" style="width:auto; vertical-align: middle;">
 <label for="is24hour" style="display:inline; font-weight:normal;">24-Hour Format</label>
 </div>
+
 <h3>Quiet Hours</h3>
 <div class="form-group">
-<input type="checkbox" id="quietEnabled" name="quietEnabled" style="width:auto; vertical-align: middle;">
-<label for="quietEnabled" style="display:inline; font-weight:normal;">Enable Quiet Hours (no flap movement)</label>
-</div>
-<div id="quiet-hours-24" class="form-group-inline">
-<label for="quietStart24" style="display:inline; font-weight:normal; margin-bottom:0;">Start (0-23):</label>
-<input type="number" id="quietStart24" name="quietStart24" min="0" max="23">
-<label for="quietEnd24" style="display:inline; font-weight:normal; margin-bottom:0;">End (0-23):</label>
-<input type="number" id="quietEnd24" name="quietEnd24" min="0" max="23">
-</div>
-<div id="quiet-hours-12" class="form-group-inline" style="display: none;">
-    <label style="display:inline; font-weight:normal; margin-bottom:0;">Start:</label>
-    <select id="quietStartHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
-    <select id="quietStartAmPm"><option>AM</option><option>PM</option></select>
-    <label style="display:inline; font-weight:normal; margin-bottom:0;">End:</label>
-    <select id="quietEndHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
-    <select id="quietEndAmPm"><option>AM</option><option>PM</option></select>
+  <input type="checkbox" id="quietEnabled" name="quietEnabled" style="width:auto; vertical-align: middle;">
+  <label for="quietEnabled" style="display:inline; font-weight:normal;">Enable Quiet Hours (no flap movement)</label>
+  <div class="info" style="font-size:0.9em; margin-top:5px;">Note: Quiet hours requires an active NTP connection and will not function in manual time mode.</div>
 </div>
 
-<button type="submit" class="btn btn-primary">Save All Settings & Use NTP</button>
+<div class="schedule-box">
+  <div class="schedule-title">Schedule A</div>
+  <div class="day-selector" id="day-selector-A">
+    <span class="day-button" data-day="0">S</span>
+    <span class="day-button" data-day="1">M</span>
+    <span class="day-button" data-day="2">T</span>
+    <span class="day-button" data-day="3">W</span>
+    <span class="day-button" data-day="4">T</span>
+    <span class="day-button" data-day="5">F</span>
+    <span class="day-button" data-day="6">S</span>
+  </div>
+  <div class="form-group-inline qh-24" style="margin-top: 15px;">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">Start (0-23):</label>
+    <input type="number" id="quietStartA24" min="0" max="23">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">End (0-23):</label>
+    <input type="number" id="quietEndA24" min="0" max="23">
+  </div>
+  <div class="form-group-inline qh-12" style="display: none; margin-top: 15px;">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">Start:</label>
+    <select id="quietStartAHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
+    <select id="quietStartAAmPm"><option>AM</option><option>PM</option></select>
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">End:</label>
+    <select id="quietEndAHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
+    <select id="quietEndAAmPm"><option>AM</option><option>PM</option></select>
+  </div>
+</div>
+
+<div class="schedule-box">
+  <div class="schedule-title">Schedule B</div>
+  <div class="day-selector" id="day-selector-B">
+    <span class="day-button" data-day="0">S</span>
+    <span class="day-button" data-day="1">M</span>
+    <span class="day-button" data-day="2">T</span>
+    <span class="day-button" data-day="3">W</span>
+    <span class="day-button" data-day="4">T</span>
+    <span class="day-button" data-day="5">F</span>
+    <span class="day-button" data-day="6">S</span>
+  </div>
+  <div class="form-group-inline qh-24" style="margin-top: 15px;">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">Start (0-23):</label>
+    <input type="number" id="quietStartB24" min="0" max="23">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">End (0-23):</label>
+    <input type="number" id="quietEndB24" min="0" max="23">
+  </div>
+  <div class="form-group-inline qh-12" style="display: none; margin-top: 15px;">
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">Start:</label>
+    <select id="quietStartBHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
+    <select id="quietStartBAmPm"><option>AM</option><option>PM</option></select>
+    <label style="display:inline; font-weight:normal; margin-bottom:0;">End:</label>
+    <select id="quietEndBHour12"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option></select>
+    <select id="quietEndBAmPm"><option>AM</option><option>PM</option></select>
+  </div>
+</div>
+
+<button type="submit" class="btn btn-primary" style="margin-top:20px;">Save All Settings & Use NTP</button>
 </form>
 
 <h3>Manual Time Set</h3>
@@ -308,8 +383,8 @@ function from12to24(hour12, ampm) {
 }
 
 function setQuietHoursUI(is24HourMode) {
-    document.getElementById('quiet-hours-24').style.display = is24HourMode ? 'flex' : 'none';
-    document.getElementById('quiet-hours-12').style.display = is24HourMode ? 'none' : 'flex';
+    document.querySelectorAll('.qh-24').forEach(el => el.style.display = is24HourMode ? 'flex' : 'none');
+    document.querySelectorAll('.qh-12').forEach(el => el.style.display = is24HourMode ? 'none' : 'flex');
 }
 
 function loadSettings() {
@@ -321,20 +396,45 @@ function loadSettings() {
         document.getElementById('isDst').checked = data.isDst;
         document.getElementById('quietEnabled').checked = data.quietEnabled;
 
-        // Set 24h inputs
-        document.getElementById('quietStart24').value = data.quietStart;
-        document.getElementById('quietEnd24').value = data.quietEnd;
+        // --- Schedule A Population ---
+        document.getElementById('quietStartA24').value = data.quietStartA;
+        document.getElementById('quietEndA24').value = data.quietEndA;
+        const startA12 = from24to12(data.quietStartA);
+        document.getElementById('quietStartAHour12').value = startA12.hour12;
+        document.getElementById('quietStartAAmPm').value = startA12.ampm;
+        const endA12 = from24to12(data.quietEndA);
+        document.getElementById('quietEndAHour12').value = endA12.hour12;
+        document.getElementById('quietEndAAmPm').value = endA12.ampm;
         
-        // Set 12h inputs from 24h data
-        const start12 = from24to12(data.quietStart);
-        document.getElementById('quietStartHour12').value = start12.hour12;
-        document.getElementById('quietStartAmPm').value = start12.ampm;
+        document.querySelectorAll('#day-selector-A .day-button').forEach(button => {
+            const day = parseInt(button.dataset.day, 10);
+            if ((data.quietDaysA >> day) & 1) {
+                button.classList.add('active');
+            } else {
+                button.classList.remove('active');
+            }
+        });
 
-        const end12 = from24to12(data.quietEnd);
-        document.getElementById('quietEndHour12').value = end12.hour12;
-        document.getElementById('quietEndAmPm').value = end12.ampm;
+        // --- Schedule B Population ---
+        document.getElementById('quietStartB24').value = data.quietStartB;
+        document.getElementById('quietEndB24').value = data.quietEndB;
+        const startB12 = from24to12(data.quietStartB);
+        document.getElementById('quietStartBHour12').value = startB12.hour12;
+        document.getElementById('quietStartBAmPm').value = startB12.ampm;
+        const endB12 = from24to12(data.quietEndB);
+        document.getElementById('quietEndBHour12').value = endB12.hour12;
+        document.getElementById('quietEndBAmPm').value = endB12.ampm;
 
-        // Set the correct UI visibility
+        document.querySelectorAll('#day-selector-B .day-button').forEach(button => {
+            const day = parseInt(button.dataset.day, 10);
+            if ((data.quietDaysB >> day) & 1) {
+                button.classList.add('active');
+            } else {
+                button.classList.remove('active');
+            }
+        });
+
+        // Set UI visibility
         setQuietHoursUI(data.is24hour);
 
         const now = new Date();
@@ -387,10 +487,20 @@ function restartClock() {
     }
 }
 
+function setupDaySelector(selectorId) {
+    document.querySelectorAll(`#${selectorId} .day-button`).forEach(button => {
+        button.addEventListener('click', () => {
+            button.classList.toggle('active');
+        });
+    });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     loadSettings();
     updateTime();
     setInterval(updateTime, 5000);
+    setupDaySelector('day-selector-A');
+    setupDaySelector('day-selector-B');
 
     // Event listener to toggle Quiet Hours UI
     document.getElementById('is24hour').addEventListener('change', function(event) {
@@ -401,27 +511,43 @@ document.addEventListener('DOMContentLoaded', function() {
 document.getElementById('settingsForm').addEventListener('submit', function(event) {
     event.preventDefault();
     const is24hour = document.getElementById('is24hour').checked;
-    let quietStart, quietEnd;
-
+    
+    // --- Schedule A data gathering ---
+    let quietStartA, quietEndA;
     if (is24hour) {
-        quietStart = document.getElementById('quietStart24').value;
-        quietEnd = document.getElementById('quietEnd24').value;
+        quietStartA = document.getElementById('quietStartA24').value;
+        quietEndA = document.getElementById('quietEndA24').value;
     } else {
-        const startHour12 = document.getElementById('quietStartHour12').value;
-        const startAmPm = document.getElementById('quietStartAmPm').value;
-        quietStart = from12to24(startHour12, startAmPm);
-
-        const endHour12 = document.getElementById('quietEndHour12').value;
-        const endAmPm = document.getElementById('quietEndAmPm').value;
-        quietEnd = from12to24(endHour12, endAmPm);
+        quietStartA = from12to24(document.getElementById('quietStartAHour12').value, document.getElementById('quietStartAAmPm').value);
+        quietEndA = from12to24(document.getElementById('quietEndAHour12').value, document.getElementById('quietEndAAmPm').value);
     }
+    let quietDaysA = 0;
+    document.querySelectorAll('#day-selector-A .day-button.active').forEach(button => {
+        quietDaysA |= (1 << parseInt(button.dataset.day, 10));
+    });
 
+    // --- Schedule B data gathering ---
+    let quietStartB, quietEndB;
+    if (is24hour) {
+        quietStartB = document.getElementById('quietStartB24').value;
+        quietEndB = document.getElementById('quietEndB24').value;
+    } else {
+        quietStartB = from12to24(document.getElementById('quietStartBHour12').value, document.getElementById('quietStartBAmPm').value);
+        quietEndB = from12to24(document.getElementById('quietEndBHour12').value, document.getElementById('quietEndBAmPm').value);
+    }
+    let quietDaysB = 0;
+    document.querySelectorAll('#day-selector-B .day-button.active').forEach(button => {
+        quietDaysB |= (1 << parseInt(button.dataset.day, 10));
+    });
+    
     const timezone = document.getElementById('timezone').value;
     const isDst = document.getElementById('isDst').checked;
     const quietEnabled = document.getElementById('quietEnabled').checked;
     const messageDiv = document.getElementById('message');
-
-    const url = `/save?timezone=${timezone}&is24hour=${is24hour}&isDst=${isDst}&quietEnabled=${quietEnabled}&quietStart=${quietStart}&quietEnd=${quietEnd}`;
+    
+    const url = `/save?timezone=${timezone}&is24hour=${is24hour}&isDst=${isDst}&quietEnabled=${quietEnabled}` +
+                `&quietStartA=${quietStartA}&quietEndA=${quietEndA}&quietDaysA=${quietDaysA}` +
+                `&quietStartB=${quietStartB}&quietEndB=${quietEndB}&quietDaysB=${quietDaysB}`;
 
     fetch(url).then(response => {
         if(response.ok) {
@@ -534,7 +660,7 @@ private:
     }
 };
 
-// --- Split-Flap Clock Class (Unchanged from v2.1) ---
+// --- Split-Flap Clock Class (Unchanged) ---
 class SplitFlapClock {
 public:
     enum ClockState { IDLE, RUNNING, CALIBRATION, MINUTE_ALIGN, QUIET_MODE, ERROR_STATE };
@@ -853,7 +979,11 @@ StepperMotor minutesMotor(MIN_MOTOR_IN1_PIN, MIN_MOTOR_IN2_PIN, MIN_MOTOR_IN3_PI
 StepperMotor hoursMotor(HR_MOTOR_IN1_PIN, HR_MOTOR_IN2_PIN, HR_MOTOR_IN3_PIN, HR_MOTOR_IN4_PIN, MOTOR_STEPS_PER_REVOLUTION, false);
 SplitFlapClock splitFlapClock(minutesMotor, hoursMotor, MIN_ENDSTOP_PIN, HR_ENDSTOP_PIN);
 
-// --- Web Server & System Setup Functions (Unchanged from v2.1) ---
+// Variable to track scheduled re-homing to prevent multiple triggers in the same minute
+int lastRehomeCheckMinute = -1;
+
+
+// --- Web Server & System Setup Functions ---
 void setupWebServer() {
     server.on("/", HTTP_GET, [](){
         server.send_P(200, "text/html", index_html);
@@ -869,8 +999,12 @@ void setupWebServer() {
         json += "\"is24hour\":" + String(g_is24HourDisplay ? "true" : "false") + ",";
         json += "\"isDst\":" + String(g_isDst ? "true" : "false") + ",";
         json += "\"quietEnabled\":" + String(g_quietHoursEnabled ? "true" : "false") + ",";
-        json += "\"quietStart\":" + String(g_quietHourStart) + ",";
-        json += "\"quietEnd\":" + String(g_quietHourEnd) + ",";
+        json += "\"quietStartA\":" + String(g_quietStartA) + ",";
+        json += "\"quietEndA\":" + String(g_quietEndA) + ",";
+        json += "\"quietDaysA\":" + String(g_quietDaysA) + ",";
+        json += "\"quietStartB\":" + String(g_quietStartB) + ",";
+        json += "\"quietEndB\":" + String(g_quietEndB) + ",";
+        json += "\"quietDaysB\":" + String(g_quietDaysB) + ",";
         json += "\"manualHour\":" + String(g_manualHour) + ",";
         json += "\"manualMinute\":" + String(g_manualMinute);
         json += "}";
@@ -892,17 +1026,34 @@ void setupWebServer() {
             g_isDst = server.arg("isDst") == "true";
             preferences.putBool("isDst", g_isDst);
         }
+        // New Quiet Hours Args
         if(server.hasArg("quietEnabled")) {
             g_quietHoursEnabled = server.arg("quietEnabled") == "true";
             preferences.putBool("quietEn", g_quietHoursEnabled);
         }
-        if(server.hasArg("quietStart")) {
-            g_quietHourStart = server.arg("quietStart").toInt();
-            preferences.putInt("quietSt", g_quietHourStart);
+        if(server.hasArg("quietStartA")) {
+            g_quietStartA = server.arg("quietStartA").toInt();
+            preferences.putInt("qStartA", g_quietStartA);
         }
-        if(server.hasArg("quietEnd")) {
-            g_quietHourEnd = server.arg("quietEnd").toInt();
-            preferences.putInt("quietEn", g_quietHourEnd);
+        if(server.hasArg("quietEndA")) {
+            g_quietEndA = server.arg("quietEndA").toInt();
+            preferences.putInt("qEndA", g_quietEndA);
+        }
+        if(server.hasArg("quietDaysA")) {
+            g_quietDaysA = (uint8_t)server.arg("quietDaysA").toInt();
+            preferences.putUChar("qDaysA", g_quietDaysA);
+        }
+        if(server.hasArg("quietStartB")) {
+            g_quietStartB = server.arg("quietStartB").toInt();
+            preferences.putInt("qStartB", g_quietStartB);
+        }
+        if(server.hasArg("quietEndB")) {
+            g_quietEndB = server.arg("quietEndB").toInt();
+            preferences.putInt("qEndB", g_quietEndB);
+        }
+        if(server.hasArg("quietDaysB")) {
+            g_quietDaysB = (uint8_t)server.arg("quietDaysB").toInt();
+            preferences.putUChar("qDaysB", g_quietDaysB);
         }
 
         g_ntpOffsetSeconds = g_timezoneBaseOffset + (g_isDst ? 3600 : 0);
@@ -983,22 +1134,28 @@ void loadSettings() {
     g_timezoneBaseOffset = preferences.getLong("timezone", -21600);
     g_is24HourDisplay = preferences.getBool("is24hour", false);
     g_isDst = preferences.getBool("isDst", true);
+
+    // Load new quiet hours settings
     g_quietHoursEnabled = preferences.getBool("quietEn", false);
-    g_quietHourStart = preferences.getInt("quietSt", 22);
-    g_quietHourEnd = preferences.getInt("quietEn", 7);
+    g_quietStartA = preferences.getInt("qStartA", 21);
+    g_quietEndA = preferences.getInt("qEndA", 7);
+    g_quietDaysA = preferences.getUChar("qDaysA", 0b00011110); // Mon-Thu
+    g_quietStartB = preferences.getInt("qStartB", 23);
+    g_quietEndB = preferences.getInt("qEndB", 10);
+    g_quietDaysB = preferences.getUChar("qDaysB", 0b01100001); // Fri, Sat, Sun
+    
     preferences.end();
 
     g_ntpOffsetSeconds = g_timezoneBaseOffset + (g_isDst ? 3600 : 0);
 
     Serial.printf("Loaded settings: TZ Base=%ld, DST=%s -> Final Offset=%ld, 24-Hour=%s\n",
         g_timezoneBaseOffset, g_isDst ? "Yes" : "No", g_ntpOffsetSeconds, g_is24HourDisplay ? "Yes" : "No");
-    Serial.printf("Quiet Hours: Enabled=%s, Start=%d, End=%d\n",
-        g_quietHoursEnabled ? "Yes" : "No", g_quietHourStart, g_quietHourEnd);
+    Serial.printf("Quiet Hours: Enabled=%s\n", g_quietHoursEnabled ? "Yes" : "No");
 }
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\nStarting Split-Flap Clock v2.2...");
+    Serial.println("\nStarting Split-Flap Clock v2.3...");
     
     loadSettings();
 
@@ -1048,6 +1205,32 @@ void loop() {
     ArduinoOTA.handle();
     server.handleClient();
     splitFlapClock.update();
+
+    // Scheduled Re-homing Logic
+    // This block checks the time and triggers a full re-homing sequence at
+    // 8:30 AM (08:30) and 8:30 PM (20:30).
+    int currentHour = getCurrentHour();
+    int currentMinute = getCurrentMinute();
+
+    // We only perform the check when the minute changes to ensure the action
+    // is triggered only once, not repeatedly for 60 seconds.
+    if (currentMinute != lastRehomeCheckMinute) {
+        
+        // Check if the current time matches either of the scheduled re-homing times.
+        if ((currentHour == 8 && currentMinute == 30) || (currentHour == 20 && currentMinute == 30)) {
+            Serial.printf("Scheduled re-homing triggered at %02d:%02d. Re-initializing clock...\n", currentHour, currentMinute);
+            Logger::add("Scheduled re-home triggered.");
+            
+            // Calling initialize() performs a full re-home of both motors and
+            // then moves them to the correct current time.
+            splitFlapClock.initialize();
+        }
+        
+        // Update the tracking variable to the current minute so this logic block
+        // won't execute again until the next minute.
+        lastRehomeCheckMinute = currentMinute;
+    }
+
 
     if (g_isManualTimeMode) {
         if (millis() - g_lastMinuteTick >= 60000) {
