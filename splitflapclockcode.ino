@@ -39,7 +39,7 @@
 
 // Speeds (steps per second)
 #define HOMING_SPEED_STEPS_PER_SEC 625
-#define NORMAL_SPEED_STEPS_PER_SEC 625
+#define NORMAL_SPEED_STEPS_PER_SEC 400
 
 // Time constants
 #define NTP_UPDATE_INTERVAL_MS 30000
