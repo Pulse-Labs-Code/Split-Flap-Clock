@@ -660,7 +660,7 @@ private:
     }
 };
 
-// --- Split-Flap Clock Class (Unchanged) ---
+// --- Split-Flap Clock Class (With Fixes) ---
 class SplitFlapClock {
 public:
     enum ClockState { IDLE, RUNNING, CALIBRATION, MINUTE_ALIGN, QUIET_MODE, ERROR_STATE };
@@ -933,6 +933,9 @@ private:
         }
     }
 
+    // ===================================================================
+    // =========== CORRECTED/IMPROVED handleRunning FUNCTION ===========
+    // ===================================================================
     void handleRunning() {
         if (checkForDrift()) return;
 
@@ -941,12 +944,15 @@ private:
         }
         int currentMinute = getCurrentMinute();
 
+        // If the time hasn't changed, do nothing.
         if (currentMinute == _currentMinuteFlap) return;
 
+        // Special case for the 59 -> 00 minute transition
         if (currentMinute == 0 && _currentMinuteFlap == 59) {
             int currentHour = getCurrentHour();
             bool needsFullRehome = false;
 
+            // Optional: Trigger a full re-home at midnight or on 12->1 transitions for periodic recalibration
             if (g_is24HourDisplay && currentHour == 0) {
                 needsFullRehome = true;
                 Logger::add("Midnight re-home triggered.");
@@ -959,18 +965,31 @@ private:
             if (needsFullRehome) {
                 Serial.printf("Scheduled re-homing at %02d:00. Re-initializing clock...\n", currentHour);
                 initialize();
-                return;
+                return; // Exit after re-homing
             }
 
+            // Standard top-of-hour alignment
             Serial.println("Top of the hour: Performing minute re-homing alignment.");
             _state = MINUTE_ALIGN;
             _minutesMotor.setSpeed(HOMING_SPEED_STEPS_PER_SEC);
             _minutesMotor.moveSteps(MOTOR_STEPS_PER_REVOLUTION * 2);
-            return;
+            return; // Exit to let MINUTE_ALIGN state take over
         }
 
-        moveFlaps(_minutesMotor, _minuteStepError, g_minStepsPerFlap, 1);
-        _currentMinuteFlap = currentMinute;
+        // --- THIS IS THE KEY FIX ---
+        // Calculate how many flaps to move to catch up to the current time.
+        int flapsToMove = currentMinute - _currentMinuteFlap;
+
+        // Handle the wraparound case (e.g., going from minute 58 to minute 2)
+        if (flapsToMove < 0) {
+            flapsToMove += 60;
+        }
+
+        if (flapsToMove > 0) {
+            Serial.printf("Catching up: Moving minute flap by %d (from %d to %d)\n", flapsToMove, _currentMinuteFlap, currentMinute);
+            moveFlaps(_minutesMotor, _minuteStepError, g_minStepsPerFlap, flapsToMove);
+            _currentMinuteFlap = currentMinute;
+        }
     }
 };
 
